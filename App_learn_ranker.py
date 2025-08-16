@@ -112,6 +112,9 @@ def extract_batter_id(df):
                 return df[cand].astype(str).fillna("")
     return pd.Series([""] * len(df), index=df.index)
 
+def dedup_columns(df):
+    return df.loc[:, ~df.columns.duplicated()]
+
 # -------------------- UI --------------------
 lb_file = st.file_uploader("Merged leaderboard CSV (combined across days)", type=["csv"])
 ev_file = st.file_uploader("Event-level PARQUET/CSV (with hr_outcome)", type=["parquet", "csv"])
@@ -165,6 +168,39 @@ ev["last_name"] = ev["player_name"].astype(str).apply(last_name)
 lb["batter_id_join"] = extract_batter_id(lb)
 ev["batter_id_join"] = extract_batter_id(ev)
 
+# ---------- NEW: per-day ID backfill for leaderboard (date + name_key, team-biased) ----------
+def _mode_first(s):
+    s = pd.Series(s).dropna().astype(str)
+    if s.empty: return ""
+    m = s.mode()
+    return m.iloc[0] if not m.empty else s.iloc[0]
+
+# build id lookup from raw events (same-day only)
+ev_ids = ev.dropna(subset=["game_date"]).copy()
+ev_ids["batter_id_join"] = extract_batter_id(ev_ids).astype(str).str.replace(".0","",regex=False).str.strip()
+id_lookup = (
+    ev_ids.loc[ev_ids["name_key"].astype(str).str.len() > 0,
+               ["game_date","name_key","team_code_std","batter_id_join"]]
+          .groupby(["game_date","name_key","team_code_std"], dropna=False)["batter_id_join"]
+          .agg(_mode_first)
+          .reset_index()
+)
+
+# attach candidate ID to lb where missing/empty; prefer same-team
+lb["_bid_empty"] = lb["batter_id_join"].fillna("").astype(str).str.len().eq(0)
+lb = lb.merge(
+    id_lookup.rename(columns={"team_code_std":"team_code_ev",
+                              "batter_id_join":"batter_id_from_ev"}),
+    on=["game_date","name_key"], how="left"
+)
+same_team_mask = lb["team_code_ev"].fillna("") == lb["team_code_std"].fillna("")
+lb.loc[lb["_bid_empty"] & same_team_mask, "batter_id_join"] = lb["batter_id_from_ev"]
+# clean up
+lb = lb.drop(columns=["_bid_empty","team_code_ev","batter_id_from_ev"], errors="ignore")
+lb["batter_id_join"] = lb["batter_id_join"].astype(str).str.replace(".0","",regex=False).str.strip()
+lb = dedup_columns(lb)
+# ------------------------------------------------------------------------------
+
 # -------------------- Quick diagnostics BEFORE join --------------------
 lb_dates = pd.to_datetime(lb["game_date"]).dt.date.unique()
 ev_dates = pd.to_datetime(ev["game_date"]).dt.date.unique()
@@ -198,11 +234,11 @@ def sequential_join(lb0, ev0):
     r = ev0.copy()
 
     # (0) game_date + batter_id_join (only rows where both non-empty)
-    has_l = l["batter_id_join"].str.len().gt(0).any()
-    has_r = r["batter_id_join"].str.len().gt(0).any()
+    has_l = l["batter_id_join"].astype(str).str.len().gt(0).any()
+    has_r = r["batter_id_join"].astype(str).str.len().gt(0).any()
     if has_l and has_r:
-        l0 = l[l["batter_id_join"].str.len().gt(0)].copy()
-        r0 = r[r["batter_id_join"].str.len().gt(0)].copy()
+        l0 = l[l["batter_id_join"].astype(str).str.len().gt(0)].copy()
+        r0 = r[r["batter_id_join"].astype(str).str.len().gt(0)].copy()
         m0, t0 = do_merge(l0, r0, ["game_date", "batter_id_join"], "game_date + batter_id")
         l.loc[m0.index, "hr_outcome"] = m0["hr_outcome"]
         if l["hr_outcome"].notna().any():
@@ -283,7 +319,7 @@ if (len(labeled) < len(merged)) and needs_fallback:
     st.write(f"🧩 After fuzzy (WRatio), labeled rows: {len(labeled)} / {len(merged)}")
 
 # -------------------- Extra fallback A: unique last-name + same-team (per day) --------------------
-if len(labeled) < len(merged):
+if len(labeled) < len(merged)):
     st.warning("Trying unique last-name + same-team (per day) resolver...")
     m = merged.copy()
     mask_un = m["hr_outcome"].isna()
