@@ -1,21 +1,15 @@
 # App_learn_ranker.py
 # =============================================================================
-# 📚 Learner — HR Day Ranker from Leaderboards + Event Parquet (with robust join + fuzzy fallback)
-# - Upload merged_leaderboards.csv + event-level parquet/csv (with hr_outcome)
-# - Identity join order:
-#   (0) game_date + batter_id  → (1) game_date + team_code + name_key
-#   → (2) game_date + name_key → (3) game_date + player_name_norm
-#   → (4) FUZZY within-day name_key (prefers same team), then join.
-# - Trains ensemble ranker (LGB + XGB + CatBoost) and preserves prob_2tb/prob_rbi.
-# - Exports labeled_leaderboard.csv + learning_ranker.pkl (+ optional name_map.csv if fuzzy used).
+# 📚 Learner — HR Day Ranker from Leaderboards + Event Parquet (robust join, extra fallbacks)
+# - Deterministic join → fuzzy (WRatio) → last-name+team unique → broader fuzzy (token-set)
+# - Trains LGB/XGB/Cat ranker ensemble; includes 2TB & RBI among features (if present)
+# - Exports labeled CSV + learning_ranker.pkl; also name_map & unmatched suggestions if used
 # =============================================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle
-import io
-import re
+import pickle, io, re
 from datetime import datetime
 
 # ML
@@ -26,7 +20,7 @@ import xgboost as xgb
 import catboost as cb
 
 from unidecode import unidecode
-from rapidfuzz import process, fuzz   # <-- fuzzy fallback
+from rapidfuzz import process, fuzz
 
 st.set_page_config(page_title="📚 Learner — HR Day Ranker", layout="wide")
 st.title("📚 Learner — HR Day Ranker from Leaderboards + Event Parquet")
@@ -100,6 +94,11 @@ def make_name_key(raw_name: str) -> str:
             last = combo
     return (" ".join([first[:1], last])).strip()
 
+def last_name(s: str) -> str:
+    s = clean_name_basic(s)
+    toks = s.split()
+    return toks[-1] if toks else ""
+
 def groups_from_days(day_series: pd.Series):
     d = pd.to_datetime(day_series).dt.floor("D")
     return d.groupby(d.values).size().tolist()
@@ -160,6 +159,9 @@ ev["team_code_std"] = (ev["team_code"].astype(str).apply(std_team) if "team_code
 lb["name_key"] = lb["player_name"].astype(str).apply(make_name_key)
 ev["name_key"] = ev["player_name"].astype(str).apply(make_name_key)
 
+lb["last_name"] = lb["player_name"].astype(str).apply(last_name)
+ev["last_name"] = ev["player_name"].astype(str).apply(last_name)
+
 lb["batter_id_join"] = extract_batter_id(lb)
 ev["batter_id_join"] = extract_batter_id(ev)
 
@@ -178,7 +180,7 @@ st.write("Event date range:", str(pd.to_datetime(ev["game_date"]).min().date()),
 # -------------------- Build per-day labels from event --------------------
 ev_daily = (
     ev.groupby(
-        ["game_date", "player_name_norm", "name_key", "team_code_std", "batter_id_join"],
+        ["game_date", "player_name_norm", "name_key", "last_name", "team_code_std", "batter_id_join"],
         dropna=False
     )["hr_outcome"]
     .max()
@@ -202,7 +204,7 @@ def sequential_join(lb0, ev0):
         l0 = l[l["batter_id_join"].str.len().gt(0)].copy()
         r0 = r[r["batter_id_join"].str.len().gt(0)].copy()
         m0, t0 = do_merge(l0, r0, ["game_date", "batter_id_join"], "game_date + batter_id")
-        l = pd.concat([m0, l[~l.index.isin(m0.index)]], ignore_index=True)
+        l.loc[m0.index, "hr_outcome"] = m0["hr_outcome"]
         if l["hr_outcome"].notna().any():
             return l, t0, False
 
@@ -219,28 +221,25 @@ def sequential_join(lb0, ev0):
 
     # (3) game_date + player_name_norm
     m3, t3 = do_merge(l, r, ["game_date", "player_name_norm"], "game_date + player_name_norm")
-    return m3, t3, True  # True → needs fuzzy
+    return m3, t3, True  # True → needs fallback
 # -----------------------------------------------------------------------
 
 with st.spinner("Joining labels (deterministic passes)..."):
-    merged, join_tag, needs_fuzzy = sequential_join(lb, ev_daily)
+    merged, join_tag, needs_fallback = sequential_join(lb, ev_daily)
 
 labeled = merged[merged["hr_outcome"].notna()].copy()
 st.write(f"🔎 Deterministic join tag: **{join_tag}** | Labeled so far: {len(labeled)} / {len(merged)}")
 
-# -------------------- Fuzzy fallback (within-day) --------------------
+# -------------------- Fuzzy fallback (WRatio within-day) --------------------
 name_map_rows = []
-if (len(labeled) == 0) or needs_fuzzy:
-    st.warning("Running fuzzy name resolver within each date (prefers same team when available)...")
+if (len(labeled) < len(merged)) and needs_fallback:
+    st.warning("Running fuzzy name resolver within each date (WRatio; prefers same team)...")
     m = merged.copy()
 
-    # Work only on rows still unlabeled
     mask_un = m["hr_outcome"].isna()
     if mask_un.any():
-        # Build per-day lookup for event side
         ev_by_day = {d: df.copy() for d, df in ev_daily.groupby(ev_daily["game_date"].dt.floor("D"))}
 
-        # Iterate unlabeled rows and attempt a fuzzy map
         for idx in m[mask_un].index:
             row = m.loc[idx]
             d = pd.to_datetime(row["game_date"]).floor("D")
@@ -248,38 +247,21 @@ if (len(labeled) == 0) or needs_fuzzy:
                 continue
             evd = ev_by_day[d]
 
-            # Prefer same team pool if available
-            if "team_code_std" in evd.columns and pd.notna(row.get("team_code_std", "")) and str(row.get("team_code_std","")) != "":
-                pool = evd[evd["team_code_std"] == str(row["team_code_std"])].copy()
-                if pool.empty:
-                    pool = evd.copy()
-            else:
-                pool = evd.copy()
+            pool = evd
+            if "team_code_std" in evd.columns and str(row.get("team_code_std","")) != "":
+                same_team = evd[evd["team_code_std"] == str(row["team_code_std"])]
+                pool = same_team if not same_team.empty else evd
 
             cand_keys = pool["name_key"].astype(str).tolist()
-            target = str(row["name_key"])
-
-            # If name_key is empty, try player_name_norm
-            if not target:
-                target = str(row["player_name_norm"])
-
+            target = str(row["name_key"]) if str(row["name_key"]) else str(row["player_name_norm"])
             if not cand_keys or not target:
                 continue
 
-            # Strict then looser thresholds
-            match = process.extractOne(
-                target, cand_keys,
-                scorer=fuzz.WRatio
-            )
-            if match and match[1] >= 92:
-                best = match[0]
-            else:
-                # try a slightly looser threshold
-                if match and match[1] >= 88:
-                    best = match[0]
-                else:
-                    continue
+            match = process.extractOne(target, cand_keys, scorer=fuzz.WRatio)
+            if not match or match[1] < 88:
+                continue
 
+            best = match[0]
             ev_row = pool.loc[pool["name_key"] == best]
             if not ev_row.empty:
                 hr_val = float(ev_row.iloc[0]["hr_outcome"])
@@ -292,28 +274,128 @@ if (len(labeled) == 0) or needs_fuzzy:
                     "ev_name_key": ev_row.iloc[0]["name_key"],
                     "team_lb": row.get("team_code_std",""),
                     "team_ev": ev_row.iloc[0]["team_code_std"],
-                    "score": match[1]
+                    "score": match[1],
+                    "method": "fuzzy_WRatio"
                 })
 
     merged = m
     labeled = merged[merged["hr_outcome"].notna()].copy()
-    st.write(f"🧩 After fuzzy map, labeled rows: {len(labeled)} / {len(merged)}")
-    if name_map_rows:
-        nm = pd.DataFrame(name_map_rows)
-        nm_csv = io.StringIO()
-        nm.to_csv(nm_csv, index=False)
-        st.download_button("⬇️ Download name_map (fuzzy matches) CSV", nm_csv.getvalue(), "name_map.csv", "text/csv")
+    st.write(f"🧩 After fuzzy (WRatio), labeled rows: {len(labeled)} / {len(merged)}")
 
+# -------------------- Extra fallback A: unique last-name + same-team (per day) --------------------
+if len(labeled) < len(merged):
+    st.warning("Trying unique last-name + same-team (per day) resolver...")
+    m = merged.copy()
+    mask_un = m["hr_outcome"].isna()
+    if mask_un.any():
+        for day, df_day in m[mask_un].groupby(m["game_date"].dt.floor("D")):
+            ev_day = ev_daily[ev_daily["game_date"].dt.floor("D") == day]
+            if ev_day.empty:
+                continue
+            for idx, row in df_day.iterrows():
+                ln = str(row.get("last_name",""))
+                tm = str(row.get("team_code_std",""))
+                if not ln:
+                    continue
+                pool = ev_day.copy()
+                if tm:
+                    pool = pool[pool["team_code_std"] == tm] if (pool["team_code_std"] == tm).any() else ev_day
+                cand = pool[pool["last_name"] == ln]
+                if len(cand) == 1:
+                    hr_val = float(cand.iloc[0]["hr_outcome"])
+                    m.loc[idx, "hr_outcome"] = hr_val
+                    name_map_rows.append({
+                        "game_date": str(day.date()),
+                        "lb_player": row["player_name"],
+                        "lb_name_key": row["name_key"],
+                        "ev_player": cand.iloc[0]["player_name_norm"],
+                        "ev_name_key": cand.iloc[0]["name_key"],
+                        "team_lb": tm,
+                        "team_ev": cand.iloc[0]["team_code_std"],
+                        "score": 100,
+                        "method": "unique_lastname_team"
+                    })
+    merged = m
+    labeled = merged[merged["hr_outcome"].notna()].copy()
+    st.write(f"🧩 After last-name+team, labeled rows: {len(labeled)} / {len(merged)}")
+
+# -------------------- Extra fallback B: broader fuzzy (token-set ratio within-day) --------------------
+unmatched_suggestions = []
+if len(labeled) < len(merged):
+    st.warning("Trying broader fuzzy (token-set ratio) within each date...")
+    m = merged.copy()
+    mask_un = m["hr_outcome"].isna()
+    if mask_un.any():
+        ev_by_day = {d: df.copy() for d, df in ev_daily.groupby(ev_daily["game_date"].dt.floor("D"))}
+
+        for idx in m[mask_un].index:
+            row = m.loc[idx]
+            d = pd.to_datetime(row["game_date"]).floor("D")
+            if d not in ev_by_day:
+                continue
+            evd = ev_by_day[d]
+
+            pool = evd
+            if "team_code_std" in evd.columns and str(row.get("team_code_std","")) != "":
+                same_team = evd[evd["team_code_std"] == str(row["team_code_std"])]
+                pool = same_team if not same_team.empty else evd
+
+            cand_names = pool["player_name_norm"].astype(str).tolist()
+            target = str(row["player_name_norm"])
+            if not cand_names or not target:
+                continue
+
+            matches = process.extract(
+                target, cand_names, scorer=fuzz.token_set_ratio, limit=3
+            )
+            # auto-accept only very strong matches ≥ 96 to be safe
+            if matches and matches[0][1] >= 96:
+                best = matches[0][0]
+                ev_row = pool.loc[pool["player_name_norm"] == best]
+                if not ev_row.empty:
+                    hr_val = float(ev_row.iloc[0]["hr_outcome"])
+                    m.loc[idx, "hr_outcome"] = hr_val
+                    name_map_rows.append({
+                        "game_date": str(d.date()),
+                        "lb_player": row["player_name"],
+                        "lb_name_key": row["name_key"],
+                        "ev_player": ev_row.iloc[0]["player_name_norm"],
+                        "ev_name_key": ev_row.iloc[0]["name_key"],
+                        "team_lb": row.get("team_code_std",""),
+                        "team_ev": ev_row.iloc[0]["team_code_std"],
+                        "score": matches[0][1],
+                        "method": "fuzzy_token_set"
+                    })
+            else:
+                # collect suggestions for user CSV
+                for cand, score, _ in matches:
+                    unmatched_suggestions.append({
+                        "game_date": str(d.date()),
+                        "leaderboard_player": row["player_name"],
+                        "leaderboard_name_norm": row["player_name_norm"],
+                        "team_lb": row.get("team_code_std",""),
+                        "suggested_event_name": cand,
+                        "score": score
+                    })
+
+    merged = m
+    labeled = merged[merged["hr_outcome"].notna()].copy()
+    st.write(f"🧩 After broader fuzzy, labeled rows: {len(labeled)} / {len(merged)}")
+
+# downloads for mappings / suggestions
+if name_map_rows:
+    nm = pd.DataFrame(name_map_rows)
+    nm_csv = io.StringIO(); nm.to_csv(nm_csv, index=False)
+    st.download_button("⬇️ Download name_map (auto matches) CSV", nm_csv.getvalue(), "name_map.csv", "text/csv")
+
+if unmatched_suggestions:
+    um = pd.DataFrame(unmatched_suggestions)
+    um_csv = io.StringIO(); um.to_csv(um_csv, index=False)
+    st.download_button("⬇️ Download unmatched_with_suggestions CSV", um_csv.getvalue(), "unmatched_with_suggestions.csv", "text/csv")
+
+# Hard stop if still nothing usable
 if len(labeled) == 0:
-    # Hard-stop with concrete pointers
-    # Show example of first 10 names per overlapping date to help user verify
-    st.error(
-        "❌ No label matches found after deterministic + fuzzy join.\n\n"
-        "Quick checks:\n"
-        "• Confirm your event parquet **actually contains the same dates** as the leaderboard (the app printed both ranges above).\n"
-        "• Ensure leaderboard 'player_name' strings match your prediction app’s output (accents/suffixes are normalized here).\n"
-        "• If you can ever export 'batter_id' in the leaderboard, matching becomes near-perfect."
-    )
+    st.error("❌ Still no label matches after all passes. Check suggestions CSV and verify dates/rosters.")
     st.stop()
 
 # -------------------- Feature set --------------------
@@ -336,12 +418,24 @@ if not avail:
     st.error("No usable features found in leaderboard; need at least the core columns.")
     st.stop()
 
+# build X/y/groups
 X = labeled[avail].apply(pd.to_numeric, errors="coerce").fillna(-1).astype(np.float32)
 y = labeled["hr_outcome"].astype(int).values
 groups = groups_from_days(labeled["game_date"])
 
-if X.shape[0] == 0 or X.shape[1] == 0:
-    st.error("Empty feature matrix after filtering. Double-check your leaderboard columns.")
+# guard rails: groups must sum to n, and each group must have >=2 for ranking
+n = len(y); gsum = int(np.sum(groups)) if len(groups) else 0
+min_group = min(groups) if len(groups) else 0
+if n < 10 or gsum != n or min_group < 2:
+    st.error(
+        "❌ Not enough labeled pairs for a ranker.\n"
+        f"Rows labeled: {n} | groups sum: {gsum} | min group size: {min_group}.\n"
+        "Fix: increase label matches (add batter_id to leaderboard if possible) or ensure names/teams align."
+    )
+    # still let you download the partial labeled file
+    labeled_out = labeled.sort_values(["game_date", "ranked_probability"], ascending=[True, False])
+    csv_buf = io.StringIO(); labeled_out.to_csv(csv_buf, index=False)
+    st.download_button("⬇️ Download Labeled Leaderboard CSV", csv_buf.getvalue(), "labeled_leaderboard.csv", "text/csv")
     st.stop()
 
 # -------------------- Train ranker ensemble --------------------
@@ -419,8 +513,7 @@ bundle = {
         "cat": rk_cb,
     },
     "join_info": {
-        "deterministic_strategy": "0→1→2→3 (id/team/name fallbacks)",
-        "used_fuzzy": bool(len(labeled) and labeled["hr_outcome"].isna().sum() < len(merged)),
+        "deterministic_strategy": "id→team+key→key→name; fuzzy; lastname+team; broad fuzzy",
         "labeled_rows": int(len(labeled)),
         "total_rows": int(len(merged)),
     },
@@ -435,4 +528,4 @@ st.download_button(
     mime="application/octet-stream"
 )
 
-st.caption("All 3 rankers tried; 2+TB & RBI features included if present. Robust label join with fuzzy fallback.")
+st.caption("All 3 rankers used (where possible). 2+TB & RBI kept. Robust labeling with multiple fallbacks and downloadable diagnostics.")
