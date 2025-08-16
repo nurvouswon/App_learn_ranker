@@ -18,3 +18,4 @@ fastparquet # optional parquet backend
 psutil      # system stats (if you show progress/ETA)
 tqdm        # clean progress bars
 unidecode
+rapidfuzz
