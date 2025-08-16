@@ -1,50 +1,54 @@
-# app_learn_ranker.py
+# App_learn_ranker.py
 # ============================================================
 # 📚 Learner — HR Day Ranker from Leaderboards + Event Parquet
-# - Upload merged_leaderboards.csv (no labels) + event-level parquet (with hr_outcome at event level)
-# - Create labeled leaderboard (per player/day) internally
-# - Train LGBMRanker (LambdaRank), XGBRanker, CatBoostRanker
-# - Save models -> multi_rankers.pkl
-# - Offer labeled_leaderboard.csv for download
-# - No plots, no tuner
+# - Upload merged leaderboards CSV (multi-day)
+# - Upload event-level parquet (with hr_outcome or infer from text cols)
+# - Robust date parsing (handles '8_13' by stamping season year from events)
+# - Aggressive name normalization (accents, suffixes, punctuation)
+# - Two-pass join (normalized, then ASCII-folded) + diagnostics
+# - Train LightGBM LambdaRank (day-wise groups)
+# - Download labeled dataset and learning_ranker.pkl
 # ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle
-import io
-import unicodedata
-import re
+import re, gc, pickle, unicodedata
+from io import BytesIO
 from datetime import datetime
 
 import lightgbm as lgb
-import xgboost as xgb
-from catboost import CatBoostRanker
 
-st.set_page_config(page_title="📚 HR Learner (Ranker)", layout="wide")
+# ===================== UI =====================
+st.set_page_config(page_title="📚 Learner — HR Day Ranker", layout="wide")
 st.title("📚 Learner — HR Day Ranker from Leaderboards + Event Parquet")
 
-# ------------------------------ Helpers ------------------------------
-
-def _safe_read_csv(file):
-    # Tolerant CSV loader
+# ===================== Helpers =====================
+@st.cache_data(show_spinner=False)
+def safe_read_csv(file):
+    fn = getattr(file, "name", "uploaded.csv").lower()
     try:
-        return pd.read_csv(file)
+        return pd.read_csv(file, low_memory=False)
     except UnicodeDecodeError:
         file.seek(0)
-        return pd.read_csv(file, encoding="latin1")
-    except Exception:
-        file.seek(0)
-        return pd.read_csv(file, engine="python")
+        return pd.read_csv(file, encoding="latin1", low_memory=False)
 
-def _norm_name(s: str) -> str:
-    """Normalize player names consistently (strip, NFC, common fixes)."""
+@st.cache_data(show_spinner=False)
+def safe_read_parquet(file):
+    return pd.read_parquet(file)
+
+def _strip_accents(s: str) -> str:
+    if pd.isna(s): return ""
+    return ''.join(ch for ch in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(ch))
+
+def _norm_name(s: str, aggressive: bool = True) -> str:
+    """Normalize player names consistently (strip, NFC→ASCII option, drop suffixes, unify spaces)."""
     if pd.isna(s):
         return ""
     s = str(s).strip()
     s = unicodedata.normalize("NFC", s)
-    # Common canonicalizations
+
+    # common canonicalizations first
     fixes = {
         r"^Peter Alonso$": "Pete Alonso",
         r"^Jeremy Pena$": "Jeremy Peña",
@@ -55,133 +59,129 @@ def _norm_name(s: str) -> str:
     }
     for pat, rep in fixes.items():
         s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+
+    if aggressive:
+        # remove common suffixes
+        s = re.sub(r"\b(JR\.?|SR\.?|II|III|IV)\b\.?", "", s, flags=re.IGNORECASE).strip()
+        # collapse punctuation/extra spaces (keep letters, numbers, dot, hyphen)
+        s = re.sub(r"[^\w\s\.-]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _norm_date_any(df, candidates, fallback=None):
+def _norm_date_any(df, candidates, fallback=None, force_year: int | None = None):
     """
-    Try to build a normalized date column (YYYY-MM-DD).
-    Accepts list of candidate columns. Returns pd.Series of datetime64[ns].
+    Build a normalized date (YYYY-MM-DD).
+    Accepts:
+      - ISO (2025-08-13)
+      - '8_13' (stamps force_year if provided)
+    Returns pd.Series[datetime64[ns]] floored to day.
     """
     out = None
     for col in candidates:
-        if col in df.columns:
-            v = df[col]
-            # If looks like '2025-08-13'
-            dt = pd.to_datetime(v, errors="coerce")
-            if dt.notna().any():
-                out = dt
-                break
-            # If looks like '8_13' or '08_13' -> infer year from another col if available
-            # Try to parse M_D with current year if nothing else
-            parsed = pd.to_datetime(v.astype(str).str.replace("_", "/", regex=False), errors="coerce")
-            if parsed.notna().any():
-                # If we have a year column somewhere, we could swap it in.
-                # Otherwise, keep parsed (pandas assigns current year if missing).
-                out = parsed
-                break
+        if col not in df.columns:
+            continue
+        v = df[col].astype(str).str.strip()
+
+        # try direct parse
+        dt = pd.to_datetime(v, errors="coerce")
+        if dt.notna().any():
+            out = dt
+            break
+
+        # try M_D → M/D then stamp year
+        md = pd.to_datetime(v.str.replace("_", "/", regex=False), errors="coerce")
+        if md.notna().any():
+            if force_year is not None:
+                md2 = pd.to_datetime(md.dt.strftime(f"{force_year}-%m-%d"), errors="coerce")
+                out = md2
+            else:
+                out = md
+            break
+
     if out is None:
         if fallback is not None:
             out = pd.to_datetime(fallback, errors="coerce")
         else:
             out = pd.to_datetime(pd.Series([], dtype="object"))
+
     return out.dt.floor("D") if len(out) else pd.Series([], dtype="datetime64[ns]")
 
-def _choose_features(df, preferred_order):
-    """Return list of existing columns in df following preferred order."""
-    return [c for c in preferred_order if c in df.columns]
+def _ndcg_at_k(y_true_sorted, K: int) -> float:
+    rels = np.asarray(y_true_sorted)[:K]
+    if rels.size == 0:
+        return 0.0
+    discounts = 1.0 / np.log2(np.arange(2, 2 + len(rels)))
+    dcg = float(np.sum(rels * discounts))
+    ideal = np.sort(y_true_sorted)[::-1][:K]
+    idcg = float(np.sum(ideal * discounts[: len(ideal)]))
+    return (dcg / idcg) if idcg > 0 else 0.0
 
-def _groups_from_days(dates_series):
-    """LightGBM/XGB group sizes by date."""
-    d = pd.to_datetime(dates_series).dt.floor("D")
-    return d.groupby(d.values).size().values.tolist()
+def _download_bytes(obj, filename: str) -> BytesIO:
+    bio = BytesIO(obj)
+    bio.seek(0)
+    return bio
 
-def _to_float32_df(df):
-    for c in df.columns:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
-    return df
-
-def _ensure_2d(X):
-    if isinstance(X, pd.Series):
-        return X.to_frame()
-    return X
-
-# ------------------------------ File Uploads ------------------------------
-
-st.markdown("### 1) Upload files")
-
-lb_file = st.file_uploader("Merged leaderboard CSV (combined across days)", type=["csv"], key="merged_lb")
-ev_file = st.file_uploader("Event-level Parquet (with hr_outcome at event level)", type=["parquet"], key="event_parquet")
+# ===================== Uploads =====================
+lb_file = st.file_uploader("Merged leaderboard CSV (combined across days)", type=["csv"])
+ev_file = st.file_uploader("Event-level Parquet (with hr_outcome, or text to infer)", type=["parquet"])
 
 if lb_file is not None and ev_file is not None:
     with st.spinner("Loading files..."):
-        merged = _safe_read_csv(lb_file)
-        events = pd.read_parquet(ev_file)
+        merged = safe_read_csv(lb_file)
+        events = safe_read_parquet(ev_file)
 
-    st.write(f"Leaderboards shape: {merged.shape}")
-    st.write(f"Events shape: {events.shape}")
+    # Basic cleansing
+    merged = merged.dropna(axis=1, how="all")
+    events = events.dropna(axis=1, how="all")
 
-    # ------------------------------ Normalize leaderboards ------------------------------
-    merged = merged.copy()
+    # Parse events to determine season year
+    ev = events.copy()
+    ev["game_date_norm"] = _norm_date_any(ev, ["game_date", "date", "game_date_iso", "gameDate"])
+    if ev["game_date_norm"].isna().all():
+        st.error("Could not parse any usable date from events parquet. Expect a 'game_date'-like column.")
+        st.stop()
+    season_year = int(ev["game_date_norm"].dt.year.mode().iloc[0])
 
-    # Prefer ISO date if present, else try game_date, else parse what we can
+    # Parse leaderboard dates; stamp season_year for '8_13' style
     merged["game_date_norm"] = _norm_date_any(
         merged,
         candidates=["game_date_iso", "game_date"],
+        force_year=season_year
     )
     if merged["game_date_norm"].isna().all():
         st.error("Could not parse dates from merged leaderboards. Ensure 'game_date_iso' or 'game_date' is present.")
         st.stop()
 
-    # Name normalization
+    # Normalize names (aggressive) in both
     name_col_lb = "player_name" if "player_name" in merged.columns else None
     if name_col_lb is None:
         st.error("Merged leaderboard must include 'player_name'.")
         st.stop()
-    merged["player_name_norm"] = merged[name_col_lb].astype(str).map(_norm_name)
+    merged["player_name_norm"] = merged[name_col_lb].map(lambda x: _norm_name(x, aggressive=True))
 
-    # ------------------------------ Build day labels from events ------------------------------
-    ev = events.copy()
-
-    # Derive/locate essential columns
-    # - date
-    ev_date_candidates = ["game_date", "date", "game_date_iso", "gameDate"]
-    ev["game_date_norm"] = _norm_date_any(ev, ev_date_candidates)
-    if ev["game_date_norm"].isna().all():
-        st.error("Could not parse any usable date from events parquet. Expect a 'game_date'-like column.")
-        st.stop()
-
-    # - name
     ev_name_candidates = ["player_name", "batter_name", "batter", "name"]
-    ev_name_col = None
-    for c in ev_name_candidates:
-        if c in ev.columns:
-            ev_name_col = c
-            break
+    ev_name_col = next((c for c in ev_name_candidates if c in ev.columns), None)
     if ev_name_col is None:
         st.error("Could not find a batter/player name column in events parquet (e.g., 'player_name' or 'batter_name').")
         st.stop()
-    ev["player_name_norm"] = ev[ev_name_col].astype(str).map(_norm_name)
+    ev["player_name_norm"] = ev[ev_name_col].map(lambda x: _norm_name(x, aggressive=True))
 
-    # - hr_outcome: if not present, try to synthesize from 'events' textual column
-    label_col = None
-    if "hr_outcome" in ev.columns:
-        label_col = "hr_outcome"
-    else:
-        # try to infer from textual event-type columns
+    # Ensure we have labels in events
+    label_col = "hr_outcome"
+    if label_col not in ev.columns:
+        # Try to infer from text columns if present
         text_cols = [c for c in ["events", "events_clean", "event", "play_desc"] if c in ev.columns]
         if text_cols:
             tmp = pd.Series(0, index=ev.index, dtype=np.int8)
             for c in text_cols:
                 s = ev[c].astype(str).str.lower()
-                tmp |= s.str.contains("home_run|homered|hr", regex=True).astype(np.int8)
-            ev["hr_outcome"] = tmp
-            label_col = "hr_outcome"
+                tmp |= s.str.contains(r"home[_ ]?run|homered|\bhr\b", regex=True).astype(np.int8)
+            ev[label_col] = tmp
         else:
             st.error("No 'hr_outcome' in events parquet and no textual event column to infer from.")
             st.stop()
 
-    # Aggregate to (player, day)
+    # Day-level labels (player-day)
     day_labels = (
         ev.groupby(["game_date_norm", "player_name_norm"], dropna=False)[label_col]
           .max()
@@ -189,176 +189,166 @@ if lb_file is not None and ev_file is not None:
           .rename(columns={label_col: "hr_outcome"})
     )
 
-    # ------------------------------ Join leaderboards with labels ------------------------------
+    # First join attempt
     key_cols = ["game_date_norm", "player_name_norm"]
     to_join = merged.merge(day_labels, on=key_cols, how="left", validate="m:1")
+    labeled = to_join.dropna(subset=["hr_outcome"]).copy()
 
-    # Report overlap
-    overlap_names = len(set(merged["player_name_norm"]) & set(day_labels["player_name_norm"]))
+    # If no matches, try ASCII-folded names on both sides
+    if labeled.empty:
+        merged["player_name_norm_ascii"] = merged["player_name_norm"].map(_strip_accents).str.lower()
+        day_labels["player_name_norm_ascii"] = day_labels["player_name_norm"].map(_strip_accents).str.lower()
+        key2 = ["game_date_norm", "player_name_norm_ascii"]
+        to_join2 = merged.merge(
+            day_labels.drop(columns=["player_name_norm"]),
+            on=key2, how="left", validate="m:1"
+        )
+        labeled = to_join2.dropna(subset=["hr_outcome"]).copy()
+
+    overlap_names = len(set(merged.get("player_name_norm", [])) & set(day_labels.get("player_name_norm", [])))
     overlap_dates = len(set(merged["game_date_norm"]) & set(day_labels["game_date_norm"]))
 
-    labeled = to_join.dropna(subset=["hr_outcome"]).copy()
-    labeled["hr_outcome"] = labeled["hr_outcome"].astype(int)
-
     st.info(
-        f"Labels joined. Rows with labels: {len(labeled)} (dropped {len(to_join) - len(labeled)} without event data)."
-        f"\nOverlap (unique names): {overlap_names} • Overlap (unique dates): {overlap_dates}"
+        f"Labels joined. Rows with labels: {len(labeled)} (dropped {(len(merged) - len(labeled))} without event data). "
+        f"Overlap (unique names): {overlap_names} • Overlap (unique dates): {overlap_dates}"
     )
 
     if labeled.empty:
         st.error("No label matches found after join.\n\n"
-                 "Hints:\n"
-                 "• Make sure merged leaderboard has a real date (prefer 'game_date_iso' like 2025-08-13).\n"
+                 "Hints: • Make sure merged leaderboard has a real date (prefer 'game_date_iso' like 2025-08-13). "
                  "• Ensure names match (accents, suffixes). This app already applies common fixes.")
+        # quick diagnostics
+        st.write("Examples from leaderboard (first 10):")
+        st.dataframe(merged[["game_date_norm","player_name"]].head(10))
+        st.write("Examples from events (first 10):")
+        st.dataframe(day_labels[["game_date_norm","player_name_norm"]].head(10))
         st.stop()
 
-    # ------------------------------ Feature selection ------------------------------
-    st.markdown("### 2) Select features for the ranker (auto-selected for you)")
+    # Remove junk cols commonly present
+    for junk in ["Unnamed: 0", "source_file"]:
+        if junk in labeled.columns:
+            labeled = labeled.drop(columns=[junk])
 
-    preferred_features = [
-        # Core from prediction app
-        "ranked_probability",
-        "hr_probability_iso_T",
-        "final_multiplier",
-        "overlay_multiplier",
-        "weak_pitcher_factor",
-        "hot_streak_factor",
-        "rrf_aux",
-        "model_disagreement",
+    # ===================== Feature selection =====================
+    st.subheader("2) Select features for the ranker (auto-selected for you)")
 
-        # Extras you asked to include
-        "prob_2tb",
-        "prob_rbi",
-        "final_multiplier_raw",
+    # Build a friendly feature map (derived features + raw columns)
+    feat_map = {}
 
-        # Optional weather if present on leaderboard rows
-        "temp",
-        "humidity",
-        "wind_mph",
-    ]
+    # Base prob (from leaderboard)
+    if "hr_probability_iso_T" in labeled.columns:
+        feat_map["base_prob"] = labeled["hr_probability_iso_T"].astype(float).to_numpy()
+        # logit(base_prob)
+        bp = np.clip(labeled["hr_probability_iso_T"].astype(float).to_numpy(), 1e-6, 1 - 1e-6)
+        feat_map["logit_p"] = np.log(bp / (1 - bp))
+    elif "calibrated_hr_probability" in labeled.columns:
+        feat_map["base_prob"] = labeled["calibrated_hr_probability"].astype(float).to_numpy()
+        bp = np.clip(feat_map["base_prob"], 1e-6, 1 - 1e-6)
+        feat_map["logit_p"] = np.log(bp / (1 - bp))
 
-    # Drop junk columns
-    drop_noise = [c for c in labeled.columns if c.startswith("Unnamed")]
-    if drop_noise:
-        labeled = labeled.drop(columns=drop_noise, errors="ignore")
+    # Overlay-based features
+    for c in ["final_multiplier", "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+              "final_multiplier_raw", "rrf_aux", "model_disagreement",
+              "ranked_probability", "prob_2tb", "prob_rbi",
+              "temp", "humidity", "wind_mph"]:
+        if c in labeled.columns:
+            # special: log_overlay
+            if c == "final_multiplier":
+                feat_map["log_overlay"] = np.log(np.maximum(1e-9, labeled[c].astype(float))).to_numpy()
+            feat_map[c] = pd.to_numeric(labeled[c], errors="coerce").fillna(-1).astype(float).to_numpy()
 
-    # Candidate feature columns present
-    auto_feats = _choose_features(labeled, preferred_features)
+    # Default feature list (keep it aligned with prediction app's feat_map keys)
+    default_feats = [f for f in [
+        "base_prob", "logit_p", "log_overlay",
+        "overlay_multiplier", "final_multiplier",
+        "ranked_probability", "rrf_aux", "model_disagreement",
+        "prob_2tb", "prob_rbi",
+        "temp", "humidity", "wind_mph"
+    ] if f in feat_map]
 
-    # UI multi-select (pre-checked with auto)
-    feats = st.multiselect(
-        "Features",
-        options=sorted([c for c in labeled.columns if pd.api.types.is_numeric_dtype(labeled[c])]),
-        default=auto_feats,
-    )
+    all_feat_options = list(feat_map.keys())
+    feats = st.multiselect("Features", options=all_feat_options, default=default_feats)
 
+    # Build X / y / groups
     if not feats:
-        st.error("Please select at least one numeric feature.")
+        st.error("Please select at least one feature.")
         st.stop()
 
-    # ------------------------------ Train day-wise rankers ------------------------------
-    st.markdown("### 3) Train day-wise LambdaRank model")
+    X = np.column_stack([feat_map[f] for f in feats]).astype(np.float32)
+    y = labeled["hr_outcome"].astype(int).to_numpy()
 
-    # Prepare matrices
-    train = labeled.copy()
-    train = _to_float32_df(train)
-
-    X = train[feats].copy()
-    y = train["hr_outcome"].astype(np.float32).values
-    days = pd.to_datetime(train["game_date_norm"]).dt.floor("D")
-    groups = _groups_from_days(days)
-
-    # Safety checks
-    if len(X) < 1 or X.shape[1] < 1:
-        st.error("Input data must be 2D and non-empty after feature selection.")
+    # Day-wise grouping for LambdaRank
+    if "game_date_norm" not in labeled.columns:
+        st.error("Internal error: missing game_date_norm after merge.")
         st.stop()
-    if np.sum(y) == 0:
-        st.warning("All labels are 0. Rankers can still train, but evaluation will be limited.")
+    day_series = pd.to_datetime(labeled["game_date_norm"]).dt.floor("D")
+    groups = day_series.groupby(day_series.values).size().values.tolist()
 
-    # LightGBM Ranker (LambdaRank)
-    rk_lgb = lgb.LGBMRanker(
-        objective="lambdarank",
-        metric="ndcg",
-        n_estimators=600,
-        learning_rate=0.05,
-        num_leaves=63,
-        feature_fraction=0.85,
-        bagging_fraction=0.85,
-        bagging_freq=1,
-        random_state=42,
-    )
-    rk_lgb.fit(X, y, group=groups)
+    # Sanity checks
+    if X.ndim != 2 or X.shape[0] == 0:
+        st.error("Input data must be 2D and non-empty (no rows after filtering).")
+        st.stop()
+    if len(y) != X.shape[0] or sum(groups) != X.shape[0]:
+        st.error("Grouping mismatch. Ensure sum(groups) equals number of rows and y matches X.")
+        st.stop()
+    if y.sum() == 0:
+        st.warning("All labels are 0. The ranker can still train, but quality will be limited.")
 
-    # XGBoost Ranker (pairwise)
-    rk_xgb = xgb.XGBRanker(
-        objective="rank:pairwise",
-        n_estimators=600,
-        learning_rate=0.06,
-        max_depth=6,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        reg_lambda=2.0,
-        tree_method="hist",
-        random_state=42,
-        n_jobs=0,
-    )
-    rk_xgb.fit(X, y, group=groups)
-
-    # CatBoost Ranker
-    rk_cb = CatBoostRanker(
-        iterations=800,
-        learning_rate=0.06,
-        depth=7,
-        loss_function="YetiRank",
-        random_seed=42,
-        verbose=False
-    )
-    # CatBoost needs query_id per row (here, per day). Map each day to an integer query id.
-    day_to_qid = {d: i for i, d in enumerate(sorted(days.unique()))}
-    qid = days.map(day_to_qid).astype(int).values
-    rk_cb.fit(X, y, group_id=qid)
-
+    # ===================== Train LambdaRank =====================
+    st.subheader("3) Train day-wise LambdaRank model")
+    with st.spinner("Training LGBMRanker..."):
+        rk = lgb.LGBMRanker(
+            objective="lambdarank", metric="ndcg",
+            n_estimators=600, learning_rate=0.05, num_leaves=63,
+            feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+            random_state=42
+        )
+        # Train on all data (no val to keep it simple and robust)
+        rk.fit(X, y, group=groups)
     st.success("Model trained.")
 
-    # ------------------------------ Output: labeled CSV & model bundle ------------------------------
-    st.markdown("### 4) Downloads")
+    # Simple NDCG@30 on the training set (diagnostic only)
+    scores = rk.predict(X)
+    order = np.argsort(-scores)
+    ndcg30 = _ndcg_at_k(y[order], K=30)
+    st.write(f"Training NDCG@30 (diagnostic): **{ndcg30:.4f}**")
 
-    # Labeled leaderboard CSV
+    # ===================== Downloads =====================
+    st.subheader("4) Downloads")
+    # Labeled dataset (what actually matched/joined)
     labeled_out = labeled.copy()
-    labeled_csv = labeled_out.to_csv(index=False).encode("utf-8")
+    # keep it small-ish: round some floats
+    for col in ["ranked_probability", "hr_probability_iso_T", "final_multiplier",
+                "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+                "final_multiplier_raw", "rrf_aux", "model_disagreement",
+                "prob_2tb", "prob_rbi", "temp", "humidity", "wind_mph"]:
+        if col in labeled_out.columns:
+            labeled_out[col] = pd.to_numeric(labeled_out[col], errors="coerce").round(6)
+
+    csv_bytes = labeled_out.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download labeled_leaderboard.csv",
-        data=labeled_csv,
-        file_name="labeled_leaderboard.csv",
+        "⬇️ Download labeled_merged_leaderboards.csv",
+        data=_download_bytes(csv_bytes, "labeled_merged_leaderboards.csv"),
+        file_name="labeled_merged_leaderboards.csv",
         mime="text/csv",
     )
 
     # Model bundle for prediction app
     bundle = {
-        "features": feats,
-        "models": {
-            "lgbm": rk_lgb,
-            "xgbr": rk_xgb,
-            "catb": rk_cb,
-        },
-        "meta": {
-            "trained_rows": int(len(train)),
-            "trained_days": int(len(np.unique(days))),
-            "label_positive_count": int(np.sum(y)),
-        },
+        "model": rk,
+        "features": feats,  # your prediction app will build this subset if available
+        "trained_at": datetime.utcnow().isoformat() + "Z",
     }
-    buf = io.BytesIO()
-    pickle.dump(bundle, buf)
+    pkl_bytes = BytesIO()
+    pickle.dump(bundle, pkl_bytes)
+    pkl_bytes.seek(0)
     st.download_button(
-        "⬇️ Download multi_rankers.pkl",
-        data=buf.getvalue(),
-        file_name="multi_rankers.pkl",
+        "⬇️ Download learning_ranker.pkl",
+        data=pkl_bytes,
+        file_name="learning_ranker.pkl",
         mime="application/octet-stream",
     )
 
-    # ------------------------------ Preview ------------------------------
-    st.markdown("### 5) Preview (first 50 rows of the labeled data used for training)")
-    st.dataframe(labeled_out.head(50), use_container_width=True)
+    st.caption("This bundle includes the LightGBM ranker and the exact feature list you trained with.")
 
-else:
-    st.caption("Upload both files to proceed.")
+    gc.collect()
