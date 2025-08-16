@@ -1,0 +1,19 @@
+# Core
+pandas
+numpy
+scikit-learn
+scipy
+
+# Gradient Boosting / Tree Models
+xgboost
+lightgbm
+catboost
+
+# Streamlit app
+streamlit
+
+# Utilities
+pyarrow     # for parquet
+fastparquet # optional parquet backend
+psutil      # system stats (if you show progress/ETA)
+tqdm        # clean progress bars
