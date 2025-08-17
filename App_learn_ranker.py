@@ -334,7 +334,7 @@ if (len(labeled) < len(merged)) and needs_fallback:
     st.write(f"🧩 After fuzzy (WRatio), labeled rows: {len(labeled)} / {len(merged)}")
 
 # -------------------- Extra fallback A: unique last-name + same-team (per day) --------------------
-if len(labeled) < len(merged)):
+if len(labeled) < len(merged):
     st.warning("Trying unique last-name + same-team (per day) resolver...")
     m = merged.copy()
     mask_un = m["hr_outcome"].isna()
