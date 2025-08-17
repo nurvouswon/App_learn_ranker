@@ -1,7 +1,6 @@
 # App_learn_ranker.py
 # =============================================================================
 # 📚 Learner — HR Day Ranker from Leaderboards + Event Parquet (robust join, extra fallbacks)
-# - Enrich leaderboard with batter_id from event: date+team+name_key → per-day fuzzy → deterministic ID join
 # - Deterministic join → fuzzy (WRatio) → last-name+team unique → broader fuzzy (token-set)
 # - Trains LGB/XGB/Cat ranker ensemble; includes 2TB & RBI among features (if present)
 # - Exports labeled CSV + learning_ranker.pkl; also name_map & unmatched suggestions if used
@@ -152,8 +151,10 @@ ev["game_date"] = pd.to_datetime(ev["game_date"], errors="coerce").dt.normalize(
 lb["player_name_norm"] = lb["player_name"].astype(str).apply(clean_name_basic)
 ev["player_name_norm"] = ev["player_name"].astype(str).apply(clean_name_basic)
 
-lb["team_code_std"] = lb.get("team_code", pd.Series([""]*len(lb))).astype(str).apply(std_team)
-ev["team_code_std"] = ev.get("team_code", pd.Series([""]*len(ev))).astype(str).apply(std_team)
+lb["team_code_std"] = (lb["team_code"].astype(str).apply(std_team) if "team_code" in lb.columns
+                       else pd.Series([""] * len(lb)))
+ev["team_code_std"] = (ev["team_code"].astype(str).apply(std_team) if "team_code" in ev.columns
+                       else pd.Series([""] * len(ev)))
 
 lb["name_key"] = lb["player_name"].astype(str).apply(make_name_key)
 ev["name_key"] = ev["player_name"].astype(str).apply(make_name_key)
@@ -161,8 +162,8 @@ ev["name_key"] = ev["player_name"].astype(str).apply(make_name_key)
 lb["last_name"] = lb["player_name"].astype(str).apply(last_name)
 ev["last_name"] = ev["player_name"].astype(str).apply(last_name)
 
-lb["batter_id_join"] = extract_batter_id(lb)
-ev["batter_id_join"] = extract_batter_id(ev)
+lb["batter_id_join"] = extract_batter_id(lb).fillna("").astype(str)
+ev["batter_id_join"] = extract_batter_id(ev).fillna("").astype(str)
 
 # -------------------- Quick diagnostics BEFORE join --------------------
 lb_dates = pd.to_datetime(lb["game_date"]).dt.date.unique()
@@ -186,94 +187,57 @@ ev_daily = (
     .reset_index()
 )
 
-# -------------------- NEW: Enrich leaderboard with batter_id from event --------------------
-# So the primary join can be deterministic: game_date + batter_id
-id_map = (
-    ev_daily[["game_date","team_code_std","name_key","player_name_norm","batter_id_join"]]
-    .dropna(subset=["batter_id_join"])
-    .drop_duplicates()
-)
-
-# Fast deterministic pass: date + team + name_key → bring batter_id onto leaderboard
-lb = lb.merge(
-    id_map[["game_date","team_code_std","name_key","batter_id_join"]],
-    on=["game_date","team_code_std","name_key"],
-    how="left",
-    suffixes=("","_from_ev")
-)
-
-# Per-day fuzzy to fill any remaining missing IDs
-need_id = lb["batter_id_join"].isna() | (lb["batter_id_join"].astype(str)=="")
-if need_id.any():
-    ev_by_day_for_id = {d: df.copy() for d, df in id_map.groupby(id_map["game_date"].dt.floor("D"))}
-    for idx in lb[need_id].index:
-        row = lb.loc[idx]
-        d = pd.to_datetime(row["game_date"]).floor("D")
-        pool = ev_by_day_for_id.get(d)
-        if pool is None or pool.empty:
-            continue
-        # prefer same team
-        pool2 = pool[pool["team_code_std"] == row.get("team_code_std","")]
-        if pool2.empty:
-            pool2 = pool
-        target = str(row.get("name_key") or row.get("player_name_norm") or "")
-        if not target:
-            continue
-        # try WRatio on name_key
-        cand_keys = pool2["name_key"].astype(str).tolist()
-        match = process.extractOne(target, cand_keys, scorer=fuzz.WRatio)
-        hit = None
-        if match and match[1] >= 88:
-            best = match[0]
-            hit = pool2.loc[pool2["name_key"] == best]
-        else:
-            # token_set on normalized name
-            cand_names = pool2["player_name_norm"].astype(str).tolist()
-            match = process.extractOne(target, cand_names, scorer=fuzz.token_set_ratio)
-            if match and match[1] >= 96:
-                hit = pool2.loc[pool2["player_name_norm"] == match[0]]
-        if hit is not None and not hit.empty:
-            lb.at[idx, "batter_id_join"] = hit.iloc[0]["batter_id_join"]
-
-# Make sure dtypes match for merge
-lb["batter_id_join"] = lb["batter_id_join"].fillna("").astype(str)
-ev_daily["batter_id_join"] = ev_daily["batter_id_join"].fillna("").astype(str)
-
-# -------------------- Deterministic join attempts --------------------
-def do_merge(l, r, on, tag):
-    cols = list(dict.fromkeys(on + ["hr_outcome"]))
-    m = l.merge(r[cols], on=on, how="left", suffixes=("", "_y"))
-    return m, tag
+# -------------------- Deterministic join attempts (NO partial .loc writes) --------------------
+def try_merge(left_df, right_df, on_keys):
+    cols = list(dict.fromkeys(on_keys + ["hr_outcome"]))
+    tmp = left_df.merge(right_df[cols], on=on_keys, how="left", suffixes=("", "_y"))
+    hits = int(tmp["hr_outcome"].notna().sum())
+    return tmp, hits
 
 def sequential_join(lb0, ev0):
+    # Ensure strings for join keys that may be mixed types
     l = lb0.copy()
     r = ev0.copy()
+    l["batter_id_join"] = l["batter_id_join"].fillna("").astype(str)
+    r["batter_id_join"] = r["batter_id_join"].fillna("").astype(str)
 
-    # (0) game_date + batter_id_join (primary now that we enriched)
-    has_l = l["batter_id_join"].astype(str).str.len().gt(0).any()
-    has_r = r["batter_id_join"].astype(str).str.len().gt(0).any()
-    if has_l and has_r:
-        l0 = l[l["batter_id_join"].astype(str).str.len().gt(0)].copy()
-        r0 = r[r["batter_id_join"].astype(str).str.len().gt(0)].copy()
-        m0, t0 = do_merge(l0, r0, ["game_date", "batter_id_join"], "game_date + batter_id")
-        l.loc[m0.index, "hr_outcome"] = m0["hr_outcome"]
-        if l["hr_outcome"].notna().any():
-            return l, t0, False
+    # Start with explicit hr_outcome col to fill
+    out = l.copy()
+    if "hr_outcome" not in out.columns:
+        out["hr_outcome"] = np.nan
 
-    # (1) game_date + team_code_std + name_key
-    if ("team_code_std" in l.columns) and ("team_code_std" in r.columns):
-        m1, t1 = do_merge(l, r, ["game_date", "team_code_std", "name_key"], "game_date + team_code + name_key")
-        if m1["hr_outcome"].notna().any():
-            return m1, t1, False
+    def apply_pass(on_keys, tag):
+        nonlocal out
+        merged, _ = try_merge(out.drop(columns=["hr_outcome"], errors="ignore"), r, on_keys)
+        # only fill where still NaN
+        mask = out["hr_outcome"].isna() & merged["hr_outcome"].notna()
+        out.loc[mask, "hr_outcome"] = merged.loc[mask, "hr_outcome"]
+        hits_now = int(out["hr_outcome"].notna().sum())
+        return hits_now, tag
 
-    # (2) game_date + name_key
-    m2, t2 = do_merge(l, r, ["game_date", "name_key"], "game_date + name_key")
-    if m2["hr_outcome"].notna().any():
-        return m2, t2, False
+    # Pass 0: game_date + batter_id (use right filtered to non-empty ids; left stays full)
+    r_id = r[r["batter_id_join"].str.len() > 0].copy()
+    if not r_id.empty:
+        merged_id, _ = try_merge(out.drop(columns=["hr_outcome"], errors="ignore"), r_id, ["game_date", "batter_id_join"])
+        mask = out["hr_outcome"].isna() & merged_id["hr_outcome"].notna()
+        out.loc[mask, "hr_outcome"] = merged_id.loc[mask, "hr_outcome"]
+    # Then keep trying
+    passes = [
+        (["game_date", "team_code_std", "name_key"], "game_date + team_code + name_key"),
+        (["game_date", "name_key"], "game_date + name_key"),
+        (["game_date", "player_name_norm"], "game_date + player_name_norm"),
+    ]
 
-    # (3) game_date + player_name_norm
-    m3, t3 = do_merge(l, r, ["game_date", "player_name_norm"], "game_date + player_name_norm")
-    return m3, t3, True  # True → needs fallback
+    last_tag = "game_date + player_name_norm"
+    for keys, tag in passes:
+        hits_before = int(out["hr_outcome"].notna().sum())
+        hits_now, last_tag = apply_pass(keys, tag)
+        if hits_now > hits_before and hits_now == len(out):
+            break
+
+    needs_fallback = out["hr_outcome"].isna().any()
+    return out, last_tag, needs_fallback
+# -----------------------------------------------------------------------
 
 with st.spinner("Joining labels (deterministic passes)..."):
     merged, join_tag, needs_fallback = sequential_join(lb, ev_daily)
@@ -419,7 +383,7 @@ if len(labeled) < len(merged):
                     })
             else:
                 # collect suggestions for user CSV
-                for cand, score, _ in matches:
+                for cand, score, _ in (matches or []):
                     unmatched_suggestions.append({
                         "game_date": str(d.date()),
                         "leaderboard_player": row["player_name"],
@@ -564,7 +528,7 @@ bundle = {
         "cat": rk_cb,
     },
     "join_info": {
-        "deterministic_strategy": "ID→team+key→key→name; fuzzy; lastname+team; broad fuzzy",
+        "deterministic_strategy": "id→team+key→key→name; fuzzy; lastname+team; broad fuzzy",
         "labeled_rows": int(len(labeled)),
         "total_rows": int(len(merged)),
     },
@@ -579,4 +543,4 @@ st.download_button(
     mime="application/octet-stream"
 )
 
-st.caption("All 3 rankers used (where possible). 2+TB & RBI kept. Robust labeling with ID enrichment + multiple fallbacks and downloadable diagnostics.")
+st.caption("All 3 rankers used (where possible). 2+TB & RBI kept. Robust labeling with multiple fallbacks and downloadable diagnostics.")
