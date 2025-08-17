@@ -1,6 +1,7 @@
 # App_learn_ranker.py
 # =============================================================================
 # 📚 Learner — HR Day Ranker from Leaderboards + Event Parquet (robust join, extra fallbacks)
+# - Enrich leaderboard with batter_id from event: date+team+name_key → per-day fuzzy → deterministic ID join
 # - Deterministic join → fuzzy (WRatio) → last-name+team unique → broader fuzzy (token-set)
 # - Trains LGB/XGB/Cat ranker ensemble; includes 2TB & RBI among features (if present)
 # - Exports labeled CSV + learning_ranker.pkl; also name_map & unmatched suggestions if used
@@ -112,9 +113,6 @@ def extract_batter_id(df):
                 return df[cand].astype(str).fillna("")
     return pd.Series([""] * len(df), index=df.index)
 
-def dedup_columns(df):
-    return df.loc[:, ~df.columns.duplicated()]
-
 # -------------------- UI --------------------
 lb_file = st.file_uploader("Merged leaderboard CSV (combined across days)", type=["csv"])
 ev_file = st.file_uploader("Event-level PARQUET/CSV (with hr_outcome)", type=["parquet", "csv"])
@@ -154,10 +152,8 @@ ev["game_date"] = pd.to_datetime(ev["game_date"], errors="coerce").dt.normalize(
 lb["player_name_norm"] = lb["player_name"].astype(str).apply(clean_name_basic)
 ev["player_name_norm"] = ev["player_name"].astype(str).apply(clean_name_basic)
 
-lb["team_code_std"] = (lb["team_code"].astype(str).apply(std_team) if "team_code" in lb.columns
-                       else pd.Series([""] * len(lb)))
-ev["team_code_std"] = (ev["team_code"].astype(str).apply(std_team) if "team_code" in ev.columns
-                       else pd.Series([""] * len(ev)))
+lb["team_code_std"] = lb.get("team_code", pd.Series([""]*len(lb))).astype(str).apply(std_team)
+ev["team_code_std"] = ev.get("team_code", pd.Series([""]*len(ev))).astype(str).apply(std_team)
 
 lb["name_key"] = lb["player_name"].astype(str).apply(make_name_key)
 ev["name_key"] = ev["player_name"].astype(str).apply(make_name_key)
@@ -167,39 +163,6 @@ ev["last_name"] = ev["player_name"].astype(str).apply(last_name)
 
 lb["batter_id_join"] = extract_batter_id(lb)
 ev["batter_id_join"] = extract_batter_id(ev)
-
-# ---------- NEW: per-day ID backfill for leaderboard (date + name_key, team-biased) ----------
-def _mode_first(s):
-    s = pd.Series(s).dropna().astype(str)
-    if s.empty: return ""
-    m = s.mode()
-    return m.iloc[0] if not m.empty else s.iloc[0]
-
-# build id lookup from raw events (same-day only)
-ev_ids = ev.dropna(subset=["game_date"]).copy()
-ev_ids["batter_id_join"] = extract_batter_id(ev_ids).astype(str).str.replace(".0","",regex=False).str.strip()
-id_lookup = (
-    ev_ids.loc[ev_ids["name_key"].astype(str).str.len() > 0,
-               ["game_date","name_key","team_code_std","batter_id_join"]]
-          .groupby(["game_date","name_key","team_code_std"], dropna=False)["batter_id_join"]
-          .agg(_mode_first)
-          .reset_index()
-)
-
-# attach candidate ID to lb where missing/empty; prefer same-team
-lb["_bid_empty"] = lb["batter_id_join"].fillna("").astype(str).str.len().eq(0)
-lb = lb.merge(
-    id_lookup.rename(columns={"team_code_std":"team_code_ev",
-                              "batter_id_join":"batter_id_from_ev"}),
-    on=["game_date","name_key"], how="left"
-)
-same_team_mask = lb["team_code_ev"].fillna("") == lb["team_code_std"].fillna("")
-lb.loc[lb["_bid_empty"] & same_team_mask, "batter_id_join"] = lb["batter_id_from_ev"]
-# clean up
-lb = lb.drop(columns=["_bid_empty","team_code_ev","batter_id_from_ev"], errors="ignore")
-lb["batter_id_join"] = lb["batter_id_join"].astype(str).str.replace(".0","",regex=False).str.strip()
-lb = dedup_columns(lb)
-# ------------------------------------------------------------------------------
 
 # -------------------- Quick diagnostics BEFORE join --------------------
 lb_dates = pd.to_datetime(lb["game_date"]).dt.date.unique()
@@ -223,6 +186,59 @@ ev_daily = (
     .reset_index()
 )
 
+# -------------------- NEW: Enrich leaderboard with batter_id from event --------------------
+# So the primary join can be deterministic: game_date + batter_id
+id_map = (
+    ev_daily[["game_date","team_code_std","name_key","player_name_norm","batter_id_join"]]
+    .dropna(subset=["batter_id_join"])
+    .drop_duplicates()
+)
+
+# Fast deterministic pass: date + team + name_key → bring batter_id onto leaderboard
+lb = lb.merge(
+    id_map[["game_date","team_code_std","name_key","batter_id_join"]],
+    on=["game_date","team_code_std","name_key"],
+    how="left",
+    suffixes=("","_from_ev")
+)
+
+# Per-day fuzzy to fill any remaining missing IDs
+need_id = lb["batter_id_join"].isna() | (lb["batter_id_join"].astype(str)=="")
+if need_id.any():
+    ev_by_day_for_id = {d: df.copy() for d, df in id_map.groupby(id_map["game_date"].dt.floor("D"))}
+    for idx in lb[need_id].index:
+        row = lb.loc[idx]
+        d = pd.to_datetime(row["game_date"]).floor("D")
+        pool = ev_by_day_for_id.get(d)
+        if pool is None or pool.empty:
+            continue
+        # prefer same team
+        pool2 = pool[pool["team_code_std"] == row.get("team_code_std","")]
+        if pool2.empty:
+            pool2 = pool
+        target = str(row.get("name_key") or row.get("player_name_norm") or "")
+        if not target:
+            continue
+        # try WRatio on name_key
+        cand_keys = pool2["name_key"].astype(str).tolist()
+        match = process.extractOne(target, cand_keys, scorer=fuzz.WRatio)
+        hit = None
+        if match and match[1] >= 88:
+            best = match[0]
+            hit = pool2.loc[pool2["name_key"] == best]
+        else:
+            # token_set on normalized name
+            cand_names = pool2["player_name_norm"].astype(str).tolist()
+            match = process.extractOne(target, cand_names, scorer=fuzz.token_set_ratio)
+            if match and match[1] >= 96:
+                hit = pool2.loc[pool2["player_name_norm"] == match[0]]
+        if hit is not None and not hit.empty:
+            lb.at[idx, "batter_id_join"] = hit.iloc[0]["batter_id_join"]
+
+# Make sure dtypes match for merge
+lb["batter_id_join"] = lb["batter_id_join"].fillna("").astype(str)
+ev_daily["batter_id_join"] = ev_daily["batter_id_join"].fillna("").astype(str)
+
 # -------------------- Deterministic join attempts --------------------
 def do_merge(l, r, on, tag):
     cols = list(dict.fromkeys(on + ["hr_outcome"]))
@@ -233,7 +249,7 @@ def sequential_join(lb0, ev0):
     l = lb0.copy()
     r = ev0.copy()
 
-    # (0) game_date + batter_id_join (only rows where both non-empty)
+    # (0) game_date + batter_id_join (primary now that we enriched)
     has_l = l["batter_id_join"].astype(str).str.len().gt(0).any()
     has_r = r["batter_id_join"].astype(str).str.len().gt(0).any()
     if has_l and has_r:
@@ -258,7 +274,6 @@ def sequential_join(lb0, ev0):
     # (3) game_date + player_name_norm
     m3, t3 = do_merge(l, r, ["game_date", "player_name_norm"], "game_date + player_name_norm")
     return m3, t3, True  # True → needs fallback
-# -----------------------------------------------------------------------
 
 with st.spinner("Joining labels (deterministic passes)..."):
     merged, join_tag, needs_fallback = sequential_join(lb, ev_daily)
@@ -319,7 +334,7 @@ if (len(labeled) < len(merged)) and needs_fallback:
     st.write(f"🧩 After fuzzy (WRatio), labeled rows: {len(labeled)} / {len(merged)}")
 
 # -------------------- Extra fallback A: unique last-name + same-team (per day) --------------------
-if len(labeled) < len(merged):
+if len(labeled) < len(merged)):
     st.warning("Trying unique last-name + same-team (per day) resolver...")
     m = merged.copy()
     mask_un = m["hr_outcome"].isna()
@@ -549,7 +564,7 @@ bundle = {
         "cat": rk_cb,
     },
     "join_info": {
-        "deterministic_strategy": "id→team+key→key→name; fuzzy; lastname+team; broad fuzzy",
+        "deterministic_strategy": "ID→team+key→key→name; fuzzy; lastname+team; broad fuzzy",
         "labeled_rows": int(len(labeled)),
         "total_rows": int(len(merged)),
     },
@@ -564,4 +579,4 @@ st.download_button(
     mime="application/octet-stream"
 )
 
-st.caption("All 3 rankers used (where possible). 2+TB & RBI kept. Robust labeling with multiple fallbacks and downloadable diagnostics.")
+st.caption("All 3 rankers used (where possible). 2+TB & RBI kept. Robust labeling with ID enrichment + multiple fallbacks and downloadable diagnostics.")
