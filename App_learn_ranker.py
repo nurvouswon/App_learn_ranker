@@ -298,7 +298,7 @@ if (len(labeled) < len(merged)) and needs_fallback:
     st.write(f"🧩 After fuzzy (WRatio), labeled rows: {len(labeled)} / {len(merged)}")
 
 # -------------------- Extra fallback A: unique last-name + same-team (per day) --------------------
-if len(labeled) < len(merged):
+if len(labeled) < len(merged)):
     st.warning("Trying unique last-name + same-team (per day) resolver...")
     m = merged.copy()
     mask_un = m["hr_outcome"].isna()
@@ -397,59 +397,54 @@ if len(labeled) < len(merged):
     labeled = merged[merged["hr_outcome"].notna()].copy()
     st.write(f"🧩 After broader fuzzy, labeled rows: {len(labeled)} / {len(merged)}")
 
-# -------------------- NEW: Unmatched diagnostics (who/why) --------------------
-def unmatched_diagnostics(merged_df, ev_daily_df):
-    """
-    For rows still missing hr_outcome, show whether their ID, name_key or team
-    exists in events for the same date (helps pinpoint the gap).
-    """
-    un = merged_df[merged_df["hr_outcome"].isna()].copy()
-    if un.empty:
-        st.success("🎉 All leaderboard rows matched to events.")
-        return
+# -------------------- Unmatched diagnostics (NEW) --------------------
+if len(labeled) < len(merged):
+    st.markdown("### 🔧 Unmatched diagnostics")
+    unmatched = merged[merged["hr_outcome"].isna()].copy()
 
-    # Build same-day lookup sets
-    ev_daily_df = ev_daily_df.copy()
-    ev_daily_df["date_floor"] = pd.to_datetime(ev_daily_df["game_date"]).dt.floor("D")
-    ev_by_day = {d: df for d, df in ev_daily_df.groupby("date_floor")}
-
-    flags_id, flags_name, flags_team = [], [], []
-    for idx, r in un.iterrows():
-        d = pd.to_datetime(r["game_date"]).floor("D")
-        pool = ev_by_day.get(d, None)
-        if pool is None or pool.empty:
-            flags_id.append(False); flags_name.append(False); flags_team.append(False)
-            continue
-        # checks on that day
-        rid = str(r.get("batter_id_join",""))
-        rkey = str(r.get("name_key",""))
-        rtm = str(r.get("team_code_std",""))
-        flags_id.append(rid != "" and (pool["batter_id_join"].astype(str) == rid).any())
-        flags_name.append(rkey != "" and (pool["name_key"].astype(str) == rkey).any())
-        flags_team.append(rtm != "" and (pool["team_code_std"].astype(str) == rtm).any())
-
-    un = un.assign(
-        _id_in_events_same_day=pd.Series(flags_id, index=un.index),
-        _namekey_in_events_same_day=pd.Series(flags_name, index=un.index),
-        _team_in_events_same_day=pd.Series(flags_team, index=un.index)
+    # Build lookups from event daily
+    ev_all_ids = set(ev_daily.loc[ev_daily["batter_id_join"].str.len() > 0, "batter_id_join"].astype(str))
+    ev_ids_by_date = set(
+        (pd.to_datetime(ev_daily["game_date"]).dt.floor("D").astype(str) + "|" +
+         ev_daily["batter_id_join"].astype(str))
     )
+    lb_dates_str = pd.to_datetime(unmatched["game_date"]).dt.floor("D").astype(str)
+    lb_ids = unmatched["batter_id_join"].astype(str)
+    id_present = lb_ids.str.len() > 0
 
-    show_cols = [
-        "game_date","player_name","player_name_norm","team_code_std",
-        "batter_id_join","name_key","last_name",
-        "_id_in_events_same_day","_namekey_in_events_same_day","_team_in_events_same_day"
+    def reason_row(i, r):
+        date_str = pd.to_datetime(r["game_date"]).floor("D")
+        date_ok = pd.notna(date_str)
+        date_key = str(date_str) if date_ok else "NaT"
+        bid = str(r.get("batter_id_join",""))
+        namek = str(r.get("name_key",""))
+        teamk = str(r.get("team_code_std",""))
+        if not date_ok:
+            return "NaT/invalid game_date on leaderboard"
+        if bid:
+            if (f"{date_key}|{bid}") in ev_ids_by_date:
+                return "ID+date exists in events (unexpectedly still unmatched)"
+            if bid in ev_all_ids:
+                return "ID exists in events but not on this date"
+            return "batter_id not present in event file at all"
+        # no ID -> names
+        if not namek and not teamk:
+            return "missing batter_id and name/team keys"
+        return "no ID; name/team fallback required"
+
+    unmatched = unmatched.assign(
+        reason=[reason_row(i, r) for i, r in unmatched.iterrows()]
+    )
+    diag_cols = [
+        "game_date","player_name","team_code_std","batter_id_join",
+        "player_name_norm","name_key","last_name","reason"
     ]
-    show_cols = [c for c in show_cols if c in un.columns]
-    st.warning(f"⚠️ Unmatched after all passes: {len(un)} rows")
-    st.dataframe(un[show_cols], use_container_width=True)
+    diag = unmatched[diag_cols]
+    st.dataframe(diag, use_container_width=True, height=300)
 
-    # Download
-    buf = io.StringIO(); un[show_cols].to_csv(buf, index=False)
+    buf = io.StringIO(); diag.to_csv(buf, index=False)
     st.download_button("⬇️ Download unmatched_diagnostics.csv", buf.getvalue(),
-                       file_name="unmatched_diagnostics.csv", mime="text/csv")
-
-# Show diagnostics (even if we’ll stop later)
-unmatched_diagnostics(merged, ev_daily)
+                       "unmatched_diagnostics.csv", "text/csv")
 
 # downloads for mappings / suggestions
 if name_map_rows:
