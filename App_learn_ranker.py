@@ -397,55 +397,6 @@ if len(labeled) < len(merged):
     labeled = merged[merged["hr_outcome"].notna()].copy()
     st.write(f"🧩 After broader fuzzy, labeled rows: {len(labeled)} / {len(merged)}")
 
-# -------------------- Unmatched diagnostics (NEW) --------------------
-if len(labeled) < len(merged):
-    st.markdown("### 🔧 Unmatched diagnostics")
-    unmatched = merged[merged["hr_outcome"].isna()].copy()
-
-    # Build lookups from event daily
-    ev_all_ids = set(ev_daily.loc[ev_daily["batter_id_join"].str.len() > 0, "batter_id_join"].astype(str))
-    ev_ids_by_date = set(
-        (pd.to_datetime(ev_daily["game_date"]).dt.floor("D").astype(str) + "|" +
-         ev_daily["batter_id_join"].astype(str))
-    )
-    lb_dates_str = pd.to_datetime(unmatched["game_date"]).dt.floor("D").astype(str)
-    lb_ids = unmatched["batter_id_join"].astype(str)
-    id_present = lb_ids.str.len() > 0
-
-    def reason_row(i, r):
-        date_str = pd.to_datetime(r["game_date"]).floor("D")
-        date_ok = pd.notna(date_str)
-        date_key = str(date_str) if date_ok else "NaT"
-        bid = str(r.get("batter_id_join",""))
-        namek = str(r.get("name_key",""))
-        teamk = str(r.get("team_code_std",""))
-        if not date_ok:
-            return "NaT/invalid game_date on leaderboard"
-        if bid:
-            if (f"{date_key}|{bid}") in ev_ids_by_date:
-                return "ID+date exists in events (unexpectedly still unmatched)"
-            if bid in ev_all_ids:
-                return "ID exists in events but not on this date"
-            return "batter_id not present in event file at all"
-        # no ID -> names
-        if not namek and not teamk:
-            return "missing batter_id and name/team keys"
-        return "no ID; name/team fallback required"
-
-    unmatched = unmatched.assign(
-        reason=[reason_row(i, r) for i, r in unmatched.iterrows()]
-    )
-    diag_cols = [
-        "game_date","player_name","team_code_std","batter_id_join",
-        "player_name_norm","name_key","last_name","reason"
-    ]
-    diag = unmatched[diag_cols]
-    st.dataframe(diag, use_container_width=True, height=300)
-
-    buf = io.StringIO(); diag.to_csv(buf, index=False)
-    st.download_button("⬇️ Download unmatched_diagnostics.csv", buf.getvalue(),
-                       "unmatched_diagnostics.csv", "text/csv")
-
 # downloads for mappings / suggestions
 if name_map_rows:
     nm = pd.DataFrame(name_map_rows)
@@ -529,9 +480,14 @@ except Exception as e:
 
 pred_cb = None; rk_cb = None
 try:
-    rk_cb = cb.CatBoost(
-        iterations=1200, learning_rate=0.05, depth=7,
-        loss_function="YetiRank", random_seed=42, verbose=False
+    # ⬇⬇⬇ THE ONLY CHANGE: use CatBoostRanker instead of CatBoost ⬇⬇⬇
+    rk_cb = cb.CatBoostRanker(
+        iterations=1200,
+        learning_rate=0.05,
+        depth=7,
+        loss_function="YetiRank",
+        random_seed=42,
+        verbose=False
     )
     rk_cb.fit(X, y, group_id=np.concatenate([[i]*g for i, g in enumerate(groups)]))
     pred_cb = rk_cb.predict(X).flatten()
